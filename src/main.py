@@ -57,6 +57,8 @@ async def part3_assignment_suite():
     print("CHECKPOINT 3: Assignment suite → outputs/*.json")
     print("=" * 60)
 
+    from openai import AuthenticationError
+
     from assignment.pipeline import (
         build_production_plugins,
         build_observability,
@@ -71,6 +73,11 @@ async def part3_assignment_suite():
         print("Suite finished.")
         print("Wrote outputs under repo outputs/")
         return result
+    except AuthenticationError as error:
+        raise SystemExit(
+            f"OpenRouter từ chối xác thực (HTTP {error.status_code}). "
+            "Kiểm tra OPENROUTER_API_KEY trong .env và chạy lại Checkpoint 3."
+        ) from None
     except NotImplementedError as e:
         print(
             "Chưa xong Checkpoint 3 (src/assignment/pipeline.py). "

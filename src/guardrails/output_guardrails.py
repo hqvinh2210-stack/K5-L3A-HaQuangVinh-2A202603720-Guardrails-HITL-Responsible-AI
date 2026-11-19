@@ -5,14 +5,40 @@ Checkpoint 2 — Output Guardrails
   - LLM-as-Judge                          ← optional (không chấm)
 """
 import re
-import textwrap
 
 from google.genai import types
-from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from agents.security_boundary import contains_secret, normalize_for_security
 from core.utils import chat_with_agent
+
+
+_CREDENTIAL_VALUE = r"""(?:\[REDACTED\]|"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;}\]]+)"""
+_SENSITIVE_PATTERNS = (
+    ("email", re.compile(r"[\w.+%-]+@[\w.-]+\.[a-z]{2,}\b", re.IGNORECASE)),
+    ("national_id", re.compile(
+        r"""\b(?:cccd|cmnd|căn\s+cước(?:\s+công\s+dân)?|national[_ ]id)["']?[ \t]*[:=#]?[ \t]*["']?"""
+        r"(?:(?:\d[ .-]?){11}|(?:\d[ .-]?){8})\d(?![ .-]?\d)",
+        re.IGNORECASE,
+    )),
+    ("phone", re.compile(r"(?<![\w+])(?:0(?:[ .-]?\d){9,10}|\+84(?:[ .-]?\d){9,10})(?!\w)")),
+    ("national_id", re.compile(r"\b(?:\d{9}|\d{12})\b")),
+    ("api_key", re.compile(
+        r"""\bapi[_ -]key["']?\s*[:=]\s*""" + _CREDENTIAL_VALUE + r"|\bsk-[a-z0-9_-]{8,}",
+        re.IGNORECASE,
+    )),
+    ("password", re.compile(
+        r"""\b(?:password|mật\s+khẩu)["']?(?:\s*[:=]\s*|\s+(?:is|là)\s+)"""
+        + _CREDENTIAL_VALUE + r"|\badmin123\b",
+        re.IGNORECASE,
+    )),
+    ("db_host", re.compile(
+        r"""\b(?:db|database)[_ ]host["']?\s*[:=]\s*""" + _CREDENTIAL_VALUE
+        + r"|\bdb\.vinbank\.internal(?::\d+)?\b",
+        re.IGNORECASE,
+    )),
+)
 
 
 # ============================================================
@@ -36,29 +62,24 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
-    redacted = response
+    counts = {}
+    redacted = normalize_for_security(response)
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    for name, pattern in _SENSITIVE_PATTERNS:
+        redacted, count = pattern.subn("[REDACTED]", redacted)
+        if count:
+            counts[name] = counts.get(name, 0) + count
+    issues = [f"{name}: {count} found" for name, count in counts.items()]
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    # The boundary also detects demo secrets with separators inside the value.
+    if contains_secret(redacted):
+        issues.append("protected_value: found")
+        redacted = "[REDACTED]"
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
-        "redacted": redacted,
+        "redacted": redacted if issues else response,
     }
 
 
@@ -149,6 +170,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.judge_checks = 0
+        self.judge_fails = 0
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +195,24 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        filtered_text = result["redacted"]
+        if not result["safe"]:
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            self.judge_checks += 1
+            verdict = await llm_safety_check(filtered_text)
+            if not verdict["safe"]:
+                self.judge_fails += 1
+                self.blocked_count += 1
+                filtered_text = "Response withheld by the output guardrail."
+
+        if filtered_text != response_text:
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=filtered_text)]
+            )
+        return llm_response
 
 
 # ============================================================
@@ -205,7 +236,7 @@ def test_content_filter():
     for resp in test_responses:
         result = content_filter(resp)
         status = "SAFE" if result["safe"] else "ISSUES FOUND"
-        print(f"  [{status}] '{resp[:60]}...'")
+        print(f"  [{status}] '{result['redacted'][:60]}...'")
         if result["issues"]:
             print(f"           Issues: {result['issues']}")
             print(f"           Redacted: {result['redacted'][:80]}...")
